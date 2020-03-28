@@ -17,7 +17,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Amr Hassan <amr.hassan@gmail.com> and Contributors",
     author_email="amr.hassan@gmail.com",
-    url="https://github.com/pylast/pylast",
+    url="https://github.com/edwillys/pylast",
     license="Apache2",
     keywords=["Last.fm", "music", "scrobble", "scrobbling"],
     packages=find_packages(where="src"),
@@ -25,7 +25,7 @@ setup(
     use_scm_version={"local_scheme": local_scheme},
     setup_requires=["setuptools_scm"],
     extras_require={
-        "tests": ["flaky", "pytest", "pytest-cov", "pytest-random-order", "pyyaml"]
+        "tests": ["flaky", "pytest", "pytest-cov", "pytest-random-order", "pyyaml", "lxml"]
     },
     python_requires=">=3.5",
     classifiers=[

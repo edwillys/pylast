@@ -24,14 +24,13 @@ import hashlib
 import html.entities
 import logging
 import shelve
-import ssl
 import tempfile
 import time
 import warnings
 import xml.dom
-from http.client import HTTPSConnection
+import requests
 from urllib.parse import quote_plus
-from xml.dom import Node, minidom
+from lxml import etree as ET
 
 import pkg_resources
 
@@ -39,7 +38,10 @@ __author__ = "Amr Hassan, hugovk, Mice Pápai"
 __copyright__ = "Copyright (C) 2008-2010 Amr Hassan, 2013-2020 hugovk, 2017 Mice Pápai"
 __license__ = "apache2"
 __email__ = "amr.hassan@gmail.com"
-__version__ = pkg_resources.get_distribution(__name__).version
+try:
+    __version__ = pkg_resources.get_distribution(__name__).version
+except:
+    __version__ = "local"
 
 
 # 1 : This error does not exist
@@ -118,9 +120,6 @@ SCROBBLE_MODE_SKIPPED = "S"
 # Delay time in seconds from section 4.4 of https://www.last.fm/api/tos
 DELAY_TIME = 0.2
 
-# Python >3.4 has sane defaults
-SSL_CONTEXT = ssl.create_default_context()
-
 logger = logging.getLogger(__name__)
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
@@ -187,6 +186,11 @@ class _Network:
         self.proxy = None
         self.last_call_time = 0
         self.limit_rate = False
+
+        # open up persistent session to make callbacks quicker later
+        self.session = requests.Session()
+        # consume one method, as it is slower in the first time
+        self.session.get(self.ws_server)
 
         # Load session_key and username from authentication token if provided
         if token and not self.session_key:
@@ -309,7 +313,7 @@ class _Network:
         doc = _Request(self, "chart.getTopTracks", params).execute(cacheable)
 
         seq = []
-        for node in doc.getElementsByTagName("track"):
+        for node in doc.findall(".//track"):
             title = _extract(node, "name")
             artist = _extract(node, "name", 1)
             track = Track(artist, title, self)
@@ -326,7 +330,7 @@ class _Network:
         doc = _Request(self, "tag.getTopTags").execute(cacheable)
 
         seq = []
-        for node in doc.getElementsByTagName("tag"):
+        for node in doc.findall(".//tag"):
             if limit and len(seq) >= limit:
                 break
             tag = Tag(_extract(node, "name"), self)
@@ -371,7 +375,7 @@ class _Network:
 
         doc = _Request(self, "geo.getTopTracks", params).execute(cacheable)
 
-        tracks = doc.getElementsByTagName("track")
+        tracks = doc.findall(".//track")
         seq = []
 
         for track in tracks:
@@ -386,7 +390,7 @@ class _Network:
     def enable_proxy(self, host, port):
         """Enable a default web proxy"""
 
-        self.proxy = [host, _number(port)]
+        self.proxy = host + ':' + _string(port)
         self.proxy_enabled = True
 
     def disable_proxy(self):
@@ -672,7 +676,7 @@ class LastFMNetwork(_Network):
             self,
             name="Last.fm",
             homepage="https://www.last.fm",
-            ws_server=("ws.audioscrobbler.com", "/2.0/"),
+            ws_server="https://ws.audioscrobbler.com/2.0/",
             api_key=api_key,
             api_secret=api_secret,
             session_key=session_key,
@@ -740,7 +744,7 @@ class LibreFMNetwork(_Network):
             self,
             name="Libre.fm",
             homepage="https://libre.fm",
-            ws_server=("libre.fm", "/2.0/"),
+            ws_server="https://libre.fm/2.0/",
             api_key=api_key,
             api_secret=api_secret,
             session_key=session_key,
@@ -877,10 +881,13 @@ class _Request:
         """Returns a file object of the cached response."""
 
         if not self._is_cached():
-            response = self._download_response()
-            self.cache.set_xml(self._get_cache_key(), response)
+            tree = self._download_response()
+            self.cache.set_xml(self._get_cache_key(), ET.tostring(tree))
+        else:
+            parser = ET.XMLParser(recover=True)
+            tree = ET.fromstring(self.cache.get_xml(self._get_cache_key()), parser)
 
-        return self.cache.get_xml(self._get_cache_key())
+        return tree
 
     def _is_cached(self):
         """Returns True if the request is already in cache."""
@@ -889,10 +896,8 @@ class _Request:
 
     def _download_response(self):
         """Returns a response body string from the server."""
-
         if self.network.limit_rate:
             self.network._delay_call()
-
         data = []
         for name in self.params.keys():
             data.append("=".join((name, quote_plus(_string(self.params[name])))))
@@ -904,69 +909,50 @@ class _Request:
             "User-Agent": "pylast/" + __version__,
         }
 
-        (host_name, host_subdir) = self.network.ws_server
-
         if self.network.is_proxy_enabled():
-            conn = HTTPSConnection(
-                context=SSL_CONTEXT,
-                host=self.network._get_proxy()[0],
-                port=self.network._get_proxy()[1],
-            )
-
-            try:
-                conn.request(
-                    method="POST",
-                    url="https://" + host_name + host_subdir,
-                    body=data,
-                    headers=headers,
-                )
-            except Exception as e:
-                raise NetworkError(self.network, e)
-
+            proxies = {self.network._get_proxy()}
         else:
-            conn = HTTPSConnection(context=SSL_CONTEXT, host=host_name)
-
-            try:
-                conn.request(method="POST", url=host_subdir, body=data, headers=headers)
-            except Exception as e:
-                raise NetworkError(self.network, e)
+            proxies = {}
 
         try:
-            response_text = _unicode(conn.getresponse().read())
+            response = self.network.session.request(
+                "POST", self.network.ws_server, 
+                data=data,
+                proxies=proxies,
+                headers=headers)
+            response.raise_for_status()
+        except Exception as e:
+            raise NetworkError(self.network, e)
+
+        try:
+            parser = ET.XMLParser(recover=True)
+            tree = ET.fromstring(response.content.replace(b"opensearch:",b""), parser)
         except Exception as e:
             raise MalformedResponseError(self.network, e)
 
         try:
-            self._check_response_for_errors(response_text)
+            self._check_response_for_errors(tree)
         finally:
-            conn.close()
-        return response_text
+            pass
+
+        return tree
 
     def execute(self, cacheable=False):
         """Returns the XML DOM response of the POST Request from the server"""
-
         if self.network.is_caching_enabled() and cacheable:
-            response = self._get_cached_response()
+            response_text = self._get_cached_response()
         else:
-            response = self._download_response()
+            response_text = self._download_response()
+        return response_text
 
-        return minidom.parseString(_string(response).replace("opensearch:", ""))
-
-    def _check_response_for_errors(self, response):
+    def _check_response_for_errors(self, doc):
         """Checks the response for errors and raises one if any exists."""
+        logger.debug(ET.tostring(doc, pretty_print=True))
 
-        try:
-            doc = minidom.parseString(_string(response).replace("opensearch:", ""))
-        except Exception as e:
-            raise MalformedResponseError(self.network, e)
-
-        e = doc.getElementsByTagName("lfm")[0]
-        # logger.debug(doc.toprettyxml())
-
-        if e.getAttribute("status") != "ok":
-            e = doc.getElementsByTagName("error")[0]
-            status = e.getAttribute("code")
-            details = e.firstChild.data.strip()
+        if doc.attrib["status"] != "ok":
+            e = doc.find(".//error")
+            status = e.attrib["code"]
+            details = e.text
             raise WSError(self.network, status, details)
 
 
@@ -1013,8 +999,8 @@ class SessionKeyGenerator:
 
         doc = request.execute()
 
-        e = doc.getElementsByTagName("token")[0]
-        return e.firstChild.data
+        e = doc.find(".//token")
+        return e[0].text
 
     def get_web_auth_url(self):
         """
@@ -1051,8 +1037,8 @@ class SessionKeyGenerator:
 
         doc = request.execute()
 
-        session_key = doc.getElementsByTagName("key")[0].firstChild.data
-        username = doc.getElementsByTagName("name")[0].firstChild.data
+        session_key = doc.find(".//key")[0].text
+        username = doc.find(".//name")[0].text
         return session_key, username
 
     def get_web_auth_session_key(self, url, token=""):
@@ -1134,11 +1120,10 @@ class _BaseObject:
     def _extract_cdata_from_request(self, method_name, tag_name, params):
         doc = self._request(method_name, True, params)
 
-        return doc.getElementsByTagName(tag_name)[0].firstChild.wholeText.strip()
+        return doc.find(".//" + tag_name).text.strip()
 
     def _get_things(self, method, thing, thing_type, params=None, cacheable=True):
         """Returns a list of the most played thing_types by this thing."""
-
         limit = params.get("limit", 1)
         seq = []
         for node in _collect_nodes(
@@ -1183,10 +1168,9 @@ class _BaseObject:
 
         doc = self._request(self.ws_prefix + ".getInfo", True)
 
-        if len(doc.getElementsByTagName("wiki")) == 0:
+        node = doc.find(".//wiki") 
+        if node is None:
             return
-
-        node = doc.getElementsByTagName("wiki")[0]
 
         return _extract(node, section)
 
@@ -1203,8 +1187,8 @@ class _Chartable:
         doc = self._request(self.ws_prefix + ".getWeeklyChartList", True)
 
         seq = []
-        for node in doc.getElementsByTagName("chart"):
-            seq.append((node.getAttribute("from"), node.getAttribute("to")))
+        for node in doc.findall(".//chart"):
+            seq.append((node.attrib["from"], node.attrib["to"]))
 
         return seq
 
@@ -1249,7 +1233,7 @@ class _Chartable:
         doc = self._request(self.ws_prefix + method, True, params)
 
         seq = []
-        for node in doc.getElementsByTagName(chart_kind.lower()):
+        for node in doc.findall(".//" + chart_kind.lower()):
             if chart_kind == "artist":
                 item = chart_type(_extract(node, "name"), self.network)
             else:
@@ -1366,7 +1350,7 @@ class _Taggable:
 
         doc = self._request(self.ws_prefix + ".getTopTags", True)
 
-        elements = doc.getElementsByTagName("tag")
+        elements = doc.findall(".//tag")
         seq = []
 
         for element in elements:
@@ -1582,18 +1566,15 @@ class _Opus(_BaseObject, _Taggable):
         doc = self._request(self.ws_prefix + ".getInfo", cacheable=True)
 
         try:
-            lfm = doc.getElementsByTagName("lfm")[0]
-            opus = next(self._get_children_by_tag_name(lfm, self.ws_prefix))
+            opus = next(self._get_children_by_tag_name(doc, self.ws_prefix))
             mbid = next(self._get_children_by_tag_name(opus, "mbid"))
-            return mbid.firstChild.nodeValue
+            return mbid.text
         except StopIteration:
             return None
 
     def _get_children_by_tag_name(self, node, tag_name):
-        for child in node.childNodes:
-            if child.nodeType == child.ELEMENT_NODE and (
-                tag_name == "*" or child.tagName == tag_name
-            ):
+        for child in node.getchildren():
+            if tag_name == "*" or child.tag == tag_name:
                 yield child
 
 
@@ -2110,7 +2091,7 @@ class Track(_Opus):
 
         doc = self._request(self.ws_prefix + ".getInfo", True)
         return (
-            doc.getElementsByTagName("streamable")[0].getAttribute("fulltrack") == "1"
+            doc.find(".//streamable").attrib["fulltrack"] == "1"
         )
 
     def get_album(self):
@@ -2118,12 +2099,12 @@ class Track(_Opus):
 
         doc = self._request(self.ws_prefix + ".getInfo", True)
 
-        albums = doc.getElementsByTagName("album")
+        albums = doc.findall(".//album")
 
         if len(albums) == 0:
             return
 
-        node = doc.getElementsByTagName("album")[0]
+        node = doc.find(".//album")
         return Album(_extract(node, "artist"), _extract(node, "title"), self.network)
 
     def love(self):
@@ -2149,7 +2130,7 @@ class Track(_Opus):
         doc = self._request(self.ws_prefix + ".getSimilar", True, params)
 
         seq = []
-        for node in doc.getElementsByTagName(self.ws_prefix):
+        for node in doc.findall(".//" + self.ws_prefix):
             title = _extract(node, "name")
             artist = _extract(node, "name", 1)
             match = _number(_extract(node, "match"))
@@ -2253,7 +2234,7 @@ class User(_BaseObject, _Chartable):
             artist = _extract(track, "artist")
             date = _extract(track, "date")
             album = _extract(track, "album")
-            timestamp = track.getElementsByTagName("date")[0].getAttribute("uts")
+            timestamp = track.find(".//date").attrib["uts"]
 
             seq.append(
                 PlayedTrack(Track(artist, title, self.network), album, date, timestamp)
@@ -2297,7 +2278,7 @@ class User(_BaseObject, _Chartable):
                 continue
             title = _extract(track, "name")
             date = _extract(track, "date")
-            timestamp = track.getElementsByTagName("date")[0].getAttribute("uts")
+            timestamp = track.find(".//date").attrib["uts"]
 
             seq.append(LovedTrack(Track(artist, title, self.network), date, timestamp))
 
@@ -2313,14 +2294,14 @@ class User(_BaseObject, _Chartable):
 
         doc = self._request(self.ws_prefix + ".getRecentTracks", False, params)
 
-        tracks = doc.getElementsByTagName("track")
+        tracks = doc.findall(".//track")
 
         if len(tracks) == 0:
             return None
 
         e = tracks[0]
 
-        if not e.hasAttribute("nowplaying"):
+        if not "nowplaying" in e.attrib:
             return None
 
         artist = _extract(e, "artist")
@@ -2365,14 +2346,14 @@ class User(_BaseObject, _Chartable):
             params,
         ):
 
-            if track.hasAttribute("nowplaying"):
+            if "nowplaying" in track.attrib:
                 continue  # to prevent the now playing track from sneaking in
 
             title = _extract(track, "name")
             artist = _extract(track, "artist")
             date = _extract(track, "date")
             album = _extract(track, "album")
-            timestamp = track.getElementsByTagName("date")[0].getAttribute("uts")
+            timestamp = track.find(".//date").attrib["uts"]
 
             seq.append(
                 PlayedTrack(Track(artist, title, self.network), album, date, timestamp)
@@ -2421,7 +2402,7 @@ class User(_BaseObject, _Chartable):
 
         doc = self._request(self.ws_prefix + ".getInfo", True)
 
-        return int(doc.getElementsByTagName("registered")[0].getAttribute("unixtime"))
+        return int(doc.find(".//registered").attrib["unixtime"])
 
     def get_tagged_albums(self, tag, limit=None, cacheable=True):
         """Returns the albums tagged by a user."""
@@ -2511,7 +2492,7 @@ class User(_BaseObject, _Chartable):
         doc = self._request(self.ws_prefix + ".getTopTags", cacheable, params)
 
         seq = []
-        for node in doc.getElementsByTagName("tag"):
+        for node in doc.findall(".//tag"):
             seq.append(
                 TopItem(
                     Tag(_extract(node, "name"), self.network), _extract(node, "count")
@@ -2556,7 +2537,7 @@ class User(_BaseObject, _Chartable):
             artist = _extract(track, "artist")
             date = _extract(track, "date")
             album = _extract(track, "album")
-            timestamp = track.getElementsByTagName("date")[0].getAttribute("uts")
+            timestamp = track.find(".//date").attrib["uts"]
 
             seq.append(
                 PlayedTrack(Track(artist, title, self.network), album, date, timestamp)
@@ -2640,7 +2621,6 @@ class _Search(_BaseObject):
         """Returns the total count of all the results."""
 
         doc = self._request(self._ws_prefix + ".search", True)
-
         return _extract(doc, "totalResults")
 
     def _retrieve_page(self, page_index):
@@ -2650,7 +2630,7 @@ class _Search(_BaseObject):
         params["page"] = str(page_index)
         doc = self._request(self._ws_prefix + ".search", True, params)
 
-        return doc.getElementsByTagName(self._ws_prefix + "matches")[0]
+        return doc.find('.//' + self._ws_prefix + "matches")
 
     def _retrieve_next_page(self):
         self._last_page_index += 1
@@ -2670,7 +2650,7 @@ class AlbumSearch(_Search):
         master_node = self._retrieve_next_page()
 
         seq = []
-        for node in master_node.getElementsByTagName("album"):
+        for node in master_node.findall(".//album"):
             seq.append(
                 Album(
                     _extract(node, "artist"),
@@ -2695,7 +2675,7 @@ class ArtistSearch(_Search):
         master_node = self._retrieve_next_page()
 
         seq = []
-        for node in master_node.getElementsByTagName("artist"):
+        for node in master_node.findall(".//artist"):
             artist = Artist(
                 _extract(node, "name"),
                 self.network,
@@ -2725,7 +2705,7 @@ class TrackSearch(_Search):
         master_node = self._retrieve_next_page()
 
         seq = []
-        for node in master_node.getElementsByTagName("track"):
+        for node in master_node.findall(".//track"):
             track = Track(
                 _extract(node, "artist"),
                 _extract(node, "name"),
@@ -2766,9 +2746,9 @@ def cleanup_nodes(doc):
     """
     Remove text nodes containing only whitespace
     """
-    for node in doc.documentElement.childNodes:
-        if node.nodeType == Node.TEXT_NODE and node.nodeValue.isspace():
-            doc.documentElement.removeChild(node)
+    for node in doc.getchildren():
+        if node.text and node.text.isspace():
+            doc.remove(node)
     return doc
 
 
@@ -2799,24 +2779,22 @@ def _collect_nodes(limit, sender, method_name, cacheable, params=None):
                 time.sleep(1)
                 tries += 1
 
-        doc = cleanup_nodes(doc)
+        #doc = cleanup_nodes(doc)
 
         # break if there are no child nodes
-        if not doc.documentElement.childNodes:
+        if not doc.getchildren():
             break
-        main = doc.documentElement.childNodes[0]
+        main = doc.getchildren()[0]
 
-        if main.hasAttribute("totalPages"):
-            total_pages = _number(main.getAttribute("totalPages"))
-        elif main.hasAttribute("totalpages"):
-            total_pages = _number(main.getAttribute("totalpages"))
+        if "totalPages" in main.attrib:
+            total_pages = _number(main.attrib["totalPages"])
+        elif "totalpages" in main.attrib:
+            total_pages = _number(main.attrib["totalpages"])
         else:
             raise Exception("No total pages attribute")
-
-        for node in main.childNodes:
-            if not node.nodeType == xml.dom.Node.TEXT_NODE and (
-                not limit or (len(nodes) < limit)
-            ):
+        
+        for node in main.getchildren():
+            if (not limit or (len(nodes) < limit)):
                 nodes.append(node)
 
         if page >= total_pages:
@@ -2830,12 +2808,11 @@ def _collect_nodes(limit, sender, method_name, cacheable, params=None):
 def _extract(node, name, index=0):
     """Extracts a value from the xml string"""
 
-    nodes = node.getElementsByTagName(name)
+    node = node.findall(".//" + name )
 
-    if len(nodes):
-        if nodes[index].firstChild:
-            return _unescape_htmlentity(nodes[index].firstChild.data.strip())
-    else:
+    try:
+        return _unescape_htmlentity(node[index].text.strip())
+    except:
         return None
 
 
@@ -2844,7 +2821,7 @@ def _extract_all(node, name, limit_count=None):
 
     seq = []
 
-    for i in range(0, len(node.getElementsByTagName(name))):
+    for i in range(0, len(node.findall(".//" + name))):
         if len(seq) == limit_count:
             break
 
@@ -2856,7 +2833,7 @@ def _extract_all(node, name, limit_count=None):
 def _extract_top_artists(doc, network):
     # TODO Maybe include the _request here too?
     seq = []
-    for node in doc.getElementsByTagName("artist"):
+    for node in doc.findall(".//artist"):
         name = _extract(node, "name")
         playcount = _extract(node, "playcount")
 
@@ -2868,7 +2845,7 @@ def _extract_top_artists(doc, network):
 def _extract_top_albums(doc, network):
     # TODO Maybe include the _request here too?
     seq = []
-    for node in doc.getElementsByTagName("album"):
+    for node in doc.findall(".//album"):
         name = _extract(node, "name")
         artist = _extract(node, "name", 1)
         playcount = _extract(node, "playcount")
@@ -2881,14 +2858,14 @@ def _extract_top_albums(doc, network):
 
 def _extract_artists(doc, network):
     seq = []
-    for node in doc.getElementsByTagName("artist"):
+    for node in doc.findall(".//artist"):
         seq.append(Artist(_extract(node, "name"), network))
     return seq
 
 
 def _extract_albums(doc, network):
     seq = []
-    for node in doc.getElementsByTagName("album"):
+    for node in doc.findall(".//album"):
         name = _extract(node, "name")
         artist = _extract(node, "name", 1)
         seq.append(Album(artist, name, network))
@@ -2897,7 +2874,7 @@ def _extract_albums(doc, network):
 
 def _extract_tracks(doc, network):
     seq = []
-    for node in doc.getElementsByTagName("track"):
+    for node in doc.findall(".//track"):
         name = _extract(node, "name")
         artist = _extract(node, "name", 1)
         seq.append(Track(artist, name, network))
