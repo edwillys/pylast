@@ -24,6 +24,9 @@ setup(
     package_dir={"": "src"},
     use_scm_version={"local_scheme": local_scheme},
     setup_requires=["setuptools_scm"],
+    install_requires=[
+        'lxml>=4.5.0',
+    ],
     extras_require={
         "tests": ["flaky", "pytest", "pytest-cov", "pytest-random-order", "pyyaml", "lxml"]
     },
